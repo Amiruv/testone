@@ -685,6 +685,20 @@
     </div>
     <div class="setup-error" id="setup-error"></div>
 
+    <div class="proxy-row" id="proxy-row" style="display:none">
+      <div style="font-size:11px;color:var(--muted);font-family:'JetBrains Mono',monospace;margin-bottom:6px;letter-spacing:1px">
+        ⚡ PERSONAL PROXY URL (optional — fixes 403 errors)
+      </div>
+      <input class="setup-input" id="proxy-input" type="url"
+        placeholder="https://your-worker.your-name.workers.dev"
+        autocomplete="off" autocorrect="off" spellcheck="false"
+        style="width:100%;margin-bottom:4px">
+      <div style="font-size:11px;color:var(--muted);margin-top:4px">
+        <a href="https://workers.cloudflare.com" target="_blank" style="color:var(--accent2);text-decoration:none">Deploy free proxy →</a>
+        &nbsp;·&nbsp; see <code style="font-size:10px">proxy-worker.js</code> in the zip
+      </div>
+    </div>
+
     <div class="setup-divider">or load from file</div>
     <label for="file-input" class="file-drop-zone" id="file-drop-zone">
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="opacity:0.5">
@@ -1067,19 +1081,32 @@ async function loadPlaylist() {
   btnLoad.disabled = true;
   btnLoad.textContent = '…';
 
-  // Strategy: direct → no-cors text fallback → two proxies
-  const attempts = [
-    { label: 'direct', fn: () => fetch(url, { mode: 'cors' }) },
-    { label: 'corsproxy', fn: () => fetch('https://corsproxy.io/?' + encodeURIComponent(url)) },
-    { label: 'allorigins', fn: () => fetch('https://api.allorigins.win/raw?url=' + encodeURIComponent(url)) },
-    { label: 'htmldriven', fn: () => fetch('https://thingproxy.freeboard.io/fetch/' + encodeURIComponent(url)) },
-  ];
+  // Personal proxy takes priority if set
+  const personalProxy = (localStorage.getItem('strm_proxy') || '').trim();
+
+  const attempts = [];
+
+  if (personalProxy) {
+    attempts.push({
+      label: 'personal-proxy',
+      fn: () => fetch(personalProxy + '?url=' + encodeURIComponent(url))
+    });
+  }
+
+  attempts.push(
+    { label: 'direct',      fn: () => fetch(url) },
+    { label: 'corsproxy',   fn: () => fetch('https://corsproxy.io/?' + encodeURIComponent(url)) },
+    { label: 'allorigins',  fn: () => fetch('https://api.allorigins.win/raw?url=' + encodeURIComponent(url)) },
+    { label: 'thingproxy',  fn: () => fetch('https://thingproxy.freeboard.io/fetch/' + encodeURIComponent(url)) },
+  );
 
   let lastErr = null;
+  let got403 = false;
 
   for (const attempt of attempts) {
     try {
       const r = await attempt.fn();
+      if (r.status === 403) { got403 = true; throw new Error(attempt.label + ' 403 Forbidden'); }
       if (!r.ok) throw new Error(attempt.label + ' HTTP ' + r.status);
       if (!r.body) throw new Error('No streaming body');
       await parseAndLaunch(r, url);
@@ -1090,12 +1117,14 @@ async function loadPlaylist() {
     }
   }
 
-  // All failed — show helpful message
-  showError(
-    lastErr?.message?.includes('403')
-      ? 'Server blocked all proxies (403). Download the .m3u file to your device and use the file picker below.'
-      : lastErr?.message || 'Could not load playlist. Try the file picker instead.'
-  );
+  // All failed
+  if (got403) {
+    // Show proxy input panel
+    $('proxy-row').style.display = 'block';
+    showError('All proxies returned 403. Deploy the free personal proxy (see below) and paste its URL above, then try again.');
+  } else {
+    showError(lastErr?.message || 'Could not load playlist. Try the file picker instead.');
+  }
 }
 
 function showError(msg) {
@@ -1512,6 +1541,19 @@ document.addEventListener('keydown', e => {
 // ══════════════════════════════════════════
 btnLoad.addEventListener('click', loadPlaylist);
 m3uInput.addEventListener('keydown', e => { if (e.key === 'Enter') loadPlaylist(); });
+
+// PROXY INPUT — persist across sessions
+const proxyInput = $('proxy-input');
+const savedProxy = localStorage.getItem('strm_proxy');
+if (savedProxy) {
+  proxyInput.value = savedProxy;
+  $('proxy-row').style.display = 'block';
+}
+proxyInput.addEventListener('change', () => {
+  const v = proxyInput.value.trim();
+  if (v) localStorage.setItem('strm_proxy', v);
+  else localStorage.removeItem('strm_proxy');
+});
 
 // FILE INPUT
 const fileInput = $('file-input');
