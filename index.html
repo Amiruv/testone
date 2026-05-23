@@ -892,37 +892,73 @@ savedList.addEventListener('click', e => {
 });
 
 // ══════════════════════════════════════════
-// M3U PARSING
+// M3U LINE PARSER (streaming, one line at a time)
 // ══════════════════════════════════════════
-function parseM3U(text) {
-  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-  const channels = [];
-  let current = {};
+function parseExtInf(line) {
+  const logoMatch = line.match(/tvg-logo="([^"]*)"/);
+  const groupMatch = line.match(/group-title="([^"]*)"/);
+  const nameMatch = line.match(/,(.+)$/);
+  const idMatch = line.match(/tvg-id="([^"]*)"/);
+  return {
+    logo: logoMatch ? logoMatch[1] : '',
+    group: groupMatch ? groupMatch[1].trim() || 'Uncategorized' : 'Uncategorized',
+    name: nameMatch ? nameMatch[1].trim() : 'Unknown',
+    tvgId: idMatch ? idMatch[1] : '',
+  };
+}
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (line.startsWith('#EXTINF:')) {
-      current = {};
-      // tvg-logo
-      const logoMatch = line.match(/tvg-logo="([^"]*)"/);
-      current.logo = logoMatch ? logoMatch[1] : '';
-      // group-title
-      const groupMatch = line.match(/group-title="([^"]*)"/);
-      current.group = groupMatch ? groupMatch[1].trim() : 'Uncategorized';
-      // channel name (after last comma)
-      const nameMatch = line.match(/,(.+)$/);
-      current.name = nameMatch ? nameMatch[1].trim() : 'Unknown';
-      // tvg-id
-      const idMatch = line.match(/tvg-id="([^"]*)"/);
-      current.tvgId = idMatch ? idMatch[1] : '';
-    } else if (line.startsWith('#')) {
-      // skip other directives
-    } else if (line.startsWith('http') || line.startsWith('rtmp') || line.startsWith('rtsp')) {
-      current.url = line;
-      if (current.name) channels.push({ ...current });
-      current = {};
+// ══════════════════════════════════════════
+// STREAMING FETCH + PARSE (handles huge files)
+// ══════════════════════════════════════════
+async function streamParseM3U(response, onProgress) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  const channels = [];
+  let buffer = '';
+  let current = null;
+  let bytesRead = 0;
+  const contentLength = parseInt(response.headers.get('content-length') || '0');
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    bytesRead += value.byteLength;
+    buffer += decoder.decode(value, { stream: true });
+
+    // Process all complete lines in buffer
+    let nl;
+    while ((nl = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+
+      if (!line) continue;
+
+      if (line.startsWith('#EXTINF:')) {
+        current = parseExtInf(line);
+      } else if (line.startsWith('#')) {
+        // skip
+      } else if (current && (line.startsWith('http') || line.startsWith('rtmp') || line.startsWith('rtsp'))) {
+        current.url = line;
+        channels.push({ ...current });
+        current = null;
+
+        // Report progress every 200 channels
+        if (channels.length % 200 === 0) {
+          const pct = contentLength ? Math.round(bytesRead / contentLength * 100) : null;
+          onProgress(channels.length, pct);
+        }
+      }
     }
   }
+
+  // Flush remaining buffer (last line with no trailing newline)
+  const last = buffer.trim();
+  if (current && last && (last.startsWith('http') || last.startsWith('rtmp'))) {
+    current.url = last;
+    channels.push({ ...current });
+  }
+
   return channels;
 }
 
@@ -936,46 +972,59 @@ async function loadPlaylist() {
   setupError.style.display = 'none';
   loadingBar.style.display = 'block';
   btnLoad.disabled = true;
+  btnLoad.textContent = '…';
 
-  try {
-    // Try direct fetch first, then CORS proxy
-    let text = '';
+  const setProgress = (count, pct) => {
+    btnLoad.textContent = count.toLocaleString();
+    if (pct !== null) setupError.style.display = 'none';
+  };
+
+  const proxies = [
+    url,
+    'https://corsproxy.io/?' + encodeURIComponent(url),
+    'https://api.allorigins.win/raw?url=' + encodeURIComponent(url),
+  ];
+
+  let lastErr = null;
+
+  for (const fetchUrl of proxies) {
     try {
-      const r = await fetch(url, { signal: AbortSignal.timeout(15000) });
+      const r = await fetch(fetchUrl);
       if (!r.ok) throw new Error('HTTP ' + r.status);
-      text = await r.text();
-    } catch (e) {
-      // Try CORS proxy
-      const proxyUrl = 'https://corsproxy.io/?' + encodeURIComponent(url);
-      const r = await fetch(proxyUrl, { signal: AbortSignal.timeout(20000) });
-      if (!r.ok) throw new Error('Proxy HTTP ' + r.status);
-      text = await r.text();
+      if (!r.body) throw new Error('No response body (streaming not supported)');
+
+      // Peek at content-type or first bytes to validate
+      const channels = await streamParseM3U(r, setProgress);
+
+      if (channels.length === 0) throw new Error('No channels found in playlist');
+
+      state.channels = channels;
+      saveUrl(url);
+      initApp();
+      return; // success
+
+    } catch (err) {
+      lastErr = err;
+      console.warn('Attempt failed:', fetchUrl, err.message);
+      // continue to next proxy
     }
-
-    if (!text.includes('#EXTM3U') && !text.includes('#EXTINF')) {
-      throw new Error('Not a valid M3U file');
-    }
-
-    state.channels = parseM3U(text);
-    if (state.channels.length === 0) throw new Error('No channels found');
-
-    saveUrl(url);
-    initApp();
-
-  } catch (err) {
-    console.error(err);
-    setupError.style.display = 'block';
-    setupError.textContent = '⚠ ' + (err.message || 'Could not load playlist');
-  } finally {
-    loadingBar.style.display = 'none';
-    btnLoad.disabled = false;
   }
+
+  // All attempts failed
+  setupError.style.display = 'block';
+  setupError.textContent = '⚠ ' + (lastErr?.message || 'Could not load playlist. Check the URL.');
+  loadingBar.style.display = 'none';
+  btnLoad.disabled = false;
+  btnLoad.textContent = 'LOAD';
 }
 
 // ══════════════════════════════════════════
 // INIT APP
 // ══════════════════════════════════════════
 function initApp() {
+  loadingBar.style.display = 'none';
+  btnLoad.disabled = false;
+  btnLoad.textContent = 'LOAD';
   setupScreen.style.display = 'none';
   appEl.style.display = 'flex';
 
