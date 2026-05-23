@@ -646,6 +646,24 @@
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
 
+  /* FILE DROP ZONE */
+  .file-drop-zone {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: var(--bg);
+    border: 1px dashed rgba(255,255,255,0.15);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    cursor: pointer;
+    transition: border-color 0.2s;
+    color: var(--muted);
+    font-size: 13px;
+    margin-bottom: 4px;
+  }
+  .file-drop-zone:hover { border-color: var(--accent); color: var(--text); }
+  .file-drop-zone.loaded { border-color: #22c55e; color: #22c55e; border-style: solid; }
+
   /* FADE IN */
   @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
   .channel-card { animation: fadeIn 0.2s ease both; }
@@ -665,7 +683,16 @@
         placeholder="https://example.com/playlist.m3u" autocomplete="off" autocorrect="off" spellcheck="false">
       <button class="btn-load" id="btn-load">LOAD</button>
     </div>
-    <div class="setup-error" id="setup-error">⚠ Could not load playlist. Check the URL and try again.</div>
+    <div class="setup-error" id="setup-error"></div>
+
+    <div class="setup-divider">or load from file</div>
+    <label for="file-input" class="file-drop-zone" id="file-drop-zone">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="opacity:0.5">
+        <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+      </svg>
+      <span id="file-label">Tap to pick .m3u / .m3u8 file</span>
+      <input type="file" id="file-input" accept=".m3u,.m3u8,.txt" style="display:none">
+    </label>
 
     <div id="saved-section" style="display:none">
       <div class="setup-divider">Saved Playlists</div>
@@ -963,7 +990,73 @@ async function streamParseM3U(response, onProgress) {
 }
 
 // ══════════════════════════════════════════
-// LOAD PLAYLIST
+// PARSE FROM TEXT (used by both URL and file)
+// ══════════════════════════════════════════
+async function parseAndLaunch(responseOrText, sourceUrl) {
+  const setProgress = (count) => {
+    btnLoad.textContent = count.toLocaleString();
+    setupError.style.display = 'none';
+  };
+
+  let channels;
+  if (typeof responseOrText === 'string') {
+    // Parse plain text (from file reader)
+    channels = parsePlainText(responseOrText, setProgress);
+  } else {
+    channels = await streamParseM3U(responseOrText, setProgress);
+  }
+
+  if (channels.length === 0) throw new Error('No channels found in playlist');
+  state.channels = channels;
+  if (sourceUrl) saveUrl(sourceUrl);
+  initApp();
+}
+
+function parsePlainText(text, onProgress) {
+  const lines = text.split('\n');
+  const channels = [];
+  let current = null;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    if (line.startsWith('#EXTINF:')) {
+      current = parseExtInf(line);
+    } else if (line.startsWith('#')) {
+      // skip
+    } else if (current && (line.startsWith('http') || line.startsWith('rtmp') || line.startsWith('rtsp'))) {
+      current.url = line;
+      channels.push({ ...current });
+      current = null;
+      if (channels.length % 500 === 0 && onProgress) onProgress(channels.length);
+    }
+  }
+  return channels;
+}
+
+// ══════════════════════════════════════════
+// LOAD FROM FILE
+// ══════════════════════════════════════════
+function loadFromFile(file) {
+  if (!file) return;
+  setupError.style.display = 'none';
+  loadingBar.style.display = 'block';
+  btnLoad.disabled = true;
+  $('file-label').textContent = file.name;
+
+  const reader = new FileReader();
+  reader.onload = async (e) => {
+    try {
+      await parseAndLaunch(e.target.result, null);
+    } catch (err) {
+      showError(err.message);
+    }
+  };
+  reader.onerror = () => showError('Could not read file');
+  reader.readAsText(file, 'utf-8');
+}
+
+// ══════════════════════════════════════════
+// LOAD PLAYLIST (from URL)
 // ══════════════════════════════════════════
 async function loadPlaylist() {
   const url = m3uInput.value.trim();
@@ -974,45 +1067,40 @@ async function loadPlaylist() {
   btnLoad.disabled = true;
   btnLoad.textContent = '…';
 
-  const setProgress = (count, pct) => {
-    btnLoad.textContent = count.toLocaleString();
-    if (pct !== null) setupError.style.display = 'none';
-  };
-
-  const proxies = [
-    url,
-    'https://corsproxy.io/?' + encodeURIComponent(url),
-    'https://api.allorigins.win/raw?url=' + encodeURIComponent(url),
+  // Strategy: direct → no-cors text fallback → two proxies
+  const attempts = [
+    { label: 'direct', fn: () => fetch(url, { mode: 'cors' }) },
+    { label: 'corsproxy', fn: () => fetch('https://corsproxy.io/?' + encodeURIComponent(url)) },
+    { label: 'allorigins', fn: () => fetch('https://api.allorigins.win/raw?url=' + encodeURIComponent(url)) },
+    { label: 'htmldriven', fn: () => fetch('https://thingproxy.freeboard.io/fetch/' + encodeURIComponent(url)) },
   ];
 
   let lastErr = null;
 
-  for (const fetchUrl of proxies) {
+  for (const attempt of attempts) {
     try {
-      const r = await fetch(fetchUrl);
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      if (!r.body) throw new Error('No response body (streaming not supported)');
-
-      // Peek at content-type or first bytes to validate
-      const channels = await streamParseM3U(r, setProgress);
-
-      if (channels.length === 0) throw new Error('No channels found in playlist');
-
-      state.channels = channels;
-      saveUrl(url);
-      initApp();
+      const r = await attempt.fn();
+      if (!r.ok) throw new Error(attempt.label + ' HTTP ' + r.status);
+      if (!r.body) throw new Error('No streaming body');
+      await parseAndLaunch(r, url);
       return; // success
-
     } catch (err) {
       lastErr = err;
-      console.warn('Attempt failed:', fetchUrl, err.message);
-      // continue to next proxy
+      console.warn('Attempt failed [' + attempt.label + ']:', err.message);
     }
   }
 
-  // All attempts failed
+  // All failed — show helpful message
+  showError(
+    lastErr?.message?.includes('403')
+      ? 'Server blocked all proxies (403). Download the .m3u file to your device and use the file picker below.'
+      : lastErr?.message || 'Could not load playlist. Try the file picker instead.'
+  );
+}
+
+function showError(msg) {
   setupError.style.display = 'block';
-  setupError.textContent = '⚠ ' + (lastErr?.message || 'Could not load playlist. Check the URL.');
+  setupError.textContent = '⚠ ' + msg;
   loadingBar.style.display = 'none';
   btnLoad.disabled = false;
   btnLoad.textContent = 'LOAD';
@@ -1372,6 +1460,22 @@ document.addEventListener('keydown', e => {
 // ══════════════════════════════════════════
 btnLoad.addEventListener('click', loadPlaylist);
 m3uInput.addEventListener('keydown', e => { if (e.key === 'Enter') loadPlaylist(); });
+
+// FILE INPUT
+const fileInput = $('file-input');
+const fileDropZone = $('file-drop-zone');
+fileInput.addEventListener('change', e => {
+  const file = e.target.files[0];
+  if (file) loadFromFile(file);
+});
+fileDropZone.addEventListener('dragover', e => { e.preventDefault(); fileDropZone.style.borderColor = 'var(--accent)'; });
+fileDropZone.addEventListener('dragleave', () => { fileDropZone.style.borderColor = ''; });
+fileDropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  fileDropZone.style.borderColor = '';
+  const file = e.dataTransfer.files[0];
+  if (file) loadFromFile(file);
+});
 
 // ══════════════════════════════════════════
 // INIT
