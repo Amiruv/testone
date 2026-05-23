@@ -1,16 +1,8 @@
-const CACHE = 'strm-v1';
-const SHELL = [
-  './',
-  './index.html',
-  './manifest.json',
-  'https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500&family=JetBrains+Mono:wght@400;600&display=swap',
-  'https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.4.12/hls.min.js',
-];
+const CACHE = 'strm-v2';
+const SHELL = ['./', './index.html', './manifest.json'];
 
 self.addEventListener('install', e => {
-  e.waitUntil(
-    caches.open(CACHE).then(c => c.addAll(SHELL).catch(() => {}))
-  );
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL).catch(() => {})));
   self.skipWaiting();
 });
 
@@ -24,8 +16,26 @@ self.addEventListener('activate', e => {
 });
 
 self.addEventListener('fetch', e => {
-  // Don't cache m3u or stream requests
   const url = e.request.url;
+
+  // Intercept requests tagged with ?strm-proxy=1 — fetch without CORS on behalf of the page
+  if (url.includes('strm-proxy=1')) {
+    const target = new URL(url).searchParams.get('target');
+    if (target) {
+      e.respondWith(
+        fetch(target, {
+          mode: 'no-cors',   // service workers can make no-cors fetches
+          headers: { 'User-Agent': 'Mozilla/5.0' },
+        }).then(r => {
+          // no-cors gives opaque response — clone it through
+          return r;
+        }).catch(err => new Response('SW fetch failed: ' + err.message, { status: 502 }))
+      );
+      return;
+    }
+  }
+
+  // Don't cache streams
   if (url.includes('.m3u') || url.includes('m3u8') || url.includes('.ts')) return;
 
   e.respondWith(

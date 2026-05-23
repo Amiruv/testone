@@ -1081,50 +1081,68 @@ async function loadPlaylist() {
   btnLoad.disabled = true;
   btnLoad.textContent = '…';
 
-  // Personal proxy takes priority if set
   const personalProxy = (localStorage.getItem('strm_proxy') || '').trim();
 
   const attempts = [];
-
   if (personalProxy) {
-    attempts.push({
-      label: 'personal-proxy',
-      fn: () => fetch(personalProxy + '?url=' + encodeURIComponent(url))
-    });
+    attempts.push({ label: 'personal-proxy', fn: () => fetch(personalProxy + '?url=' + encodeURIComponent(url)) });
   }
-
   attempts.push(
-    { label: 'direct',      fn: () => fetch(url) },
-    { label: 'corsproxy',   fn: () => fetch('https://corsproxy.io/?' + encodeURIComponent(url)) },
-    { label: 'allorigins',  fn: () => fetch('https://api.allorigins.win/raw?url=' + encodeURIComponent(url)) },
-    { label: 'thingproxy',  fn: () => fetch('https://thingproxy.freeboard.io/fetch/' + encodeURIComponent(url)) },
+    { label: 'direct',     fn: () => fetch(url) },
+    { label: 'corsproxy',  fn: () => fetch('https://corsproxy.io/?' + encodeURIComponent(url)) },
+    { label: 'allorigins', fn: () => fetch('https://api.allorigins.win/raw?url=' + encodeURIComponent(url)) },
+    // Service worker no-cors relay — works when SW is registered (HTTPS)
+    { label: 'sw-relay',   fn: () => fetch('?strm-proxy=1&target=' + encodeURIComponent(url)) },
   );
-
-  let lastErr = null;
-  let got403 = false;
 
   for (const attempt of attempts) {
     try {
       const r = await attempt.fn();
-      if (r.status === 403) { got403 = true; throw new Error(attempt.label + ' 403 Forbidden'); }
-      if (!r.ok) throw new Error(attempt.label + ' HTTP ' + r.status);
-      if (!r.body) throw new Error('No streaming body');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      if (!r.body) throw new Error('no body');
       await parseAndLaunch(r, url);
-      return; // success
+      return;
     } catch (err) {
-      lastErr = err;
-      console.warn('Attempt failed [' + attempt.label + ']:', err.message);
+      console.warn('[' + attempt.label + ']', err.message);
     }
   }
 
-  // All failed
-  if (got403) {
-    // Show proxy input panel
-    $('proxy-row').style.display = 'block';
-    showError('All proxies returned 403. Deploy the free personal proxy (see below) and paste its URL above, then try again.');
-  } else {
-    showError(lastErr?.message || 'Could not load playlist. Try the file picker instead.');
-  }
+  // All network attempts failed — show the "open in new tab then save" flow
+  showDownloadFlow(url);
+}
+
+// ══════════════════════════════════════════
+// DOWNLOAD FLOW — user downloads file, we read it
+// ══════════════════════════════════════════
+function showDownloadFlow(url) {
+  loadingBar.style.display = 'none';
+  btnLoad.disabled = false;
+  btnLoad.textContent = 'LOAD';
+
+  // Show the proxy row
+  $('proxy-row').style.display = 'block';
+
+  // Show a special error with direct download button
+  setupError.style.display = 'block';
+  setupError.innerHTML = `
+    <div style="margin-bottom:10px">⚠ Your provider blocks external requests (403). Two options:</div>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <a href="${url}" download="playlist.m3u" target="_blank"
+        style="display:flex;align-items:center;gap:8px;background:rgba(232,200,74,0.15);border:1px solid var(--accent);border-radius:6px;padding:10px 14px;color:var(--accent);text-decoration:none;font-size:13px">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+        1. Tap here to download playlist.m3u → then use file picker below
+      </a>
+      <div style="color:var(--muted);font-size:12px;padding:0 2px">
+        — or —
+      </div>
+      <div style="color:var(--muted);font-size:12px;padding:0 2px">
+        2. Deploy your free personal proxy (2 min):
+        <a href="https://workers.cloudflare.com" target="_blank" style="color:var(--accent2)">workers.cloudflare.com</a>
+        → paste <code style="font-size:11px">proxy-worker.js</code> from the zip → paste worker URL in the field above
+      </div>
+    </div>`;
 }
 
 function showError(msg) {
