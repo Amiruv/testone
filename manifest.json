@@ -1,0 +1,20 @@
+{
+  "name": "STRM — IPTV Player",
+  "short_name": "STRM",
+  "description": "Personal IPTV player for M3U playlists",
+  "start_url": "/index.html",
+  "display": "standalone",
+  "background_color": "#080c14",
+  "theme_color": "#080c14",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width='512' height='512' rx='80' fill='%23080c14'/><text x='50%25' y='58%25' font-family='serif' font-size='260' font-weight='bold' fill='%23e8c84a' text-anchor='middle' dominant-baseline='middle'>S</text></svg>",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["entertainment", "video"],
+  "screenshots": []
+}
