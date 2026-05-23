@@ -1116,20 +1116,25 @@ function initApp() {
   setupScreen.style.display = 'none';
   appEl.style.display = 'flex';
 
-  // Build categories
-  const groups = {};
-  state.channels.forEach(ch => {
-    if (!groups[ch.group]) groups[ch.group] = 0;
-    groups[ch.group]++;
-  });
+  // Show count immediately
+  channelCount.textContent = `${state.channels.length.toLocaleString()} channels`;
 
-  state.categories = Object.entries(groups)
-    .sort((a, b) => b[1] - a[1])
-    .map(([name, count]) => ({ name, count }));
+  // Defer heavy work so browser can paint the shell first
+  setTimeout(() => {
+    const groups = {};
+    state.channels.forEach(ch => {
+      if (!groups[ch.group]) groups[ch.group] = 0;
+      groups[ch.group]++;
+    });
+    state.categories = Object.entries(groups)
+      .sort((a, b) => b[1] - a[1])
+      .map(([name, count]) => ({ name, count }));
 
-  renderCategories();
-  selectCategory('ALL');
-  channelCount.textContent = `${state.channels.length} channels`;
+    renderCategories();
+    // Default to first (largest) category to avoid rendering 485k cards at once
+    const firstCat = state.categories[0]?.name || 'ALL';
+    selectCategory(firstCat);
+  }, 50);
 }
 
 // ══════════════════════════════════════════
@@ -1181,19 +1186,47 @@ function selectCategory(cat) {
 }
 
 // ══════════════════════════════════════════
-// RENDER CHANNELS
+// RENDER CHANNELS — paginated, never renders all at once
 // ══════════════════════════════════════════
-function renderChannels(query = '') {
-  let list = state.channels;
+const PAGE_SIZE = 80; // cards per batch
+let searchDebounceTimer = null;
 
+function filterChannels(query = '') {
+  let list = state.channels;
   if (state.currentCategory !== 'ALL') {
     list = list.filter(ch => ch.group === state.currentCategory);
   }
   if (query) {
-    list = list.filter(ch => ch.name.toLowerCase().includes(query));
+    const q = query.toLowerCase();
+    list = list.filter(ch => ch.name.toLowerCase().includes(q));
   }
-
   state.filtered = list;
+}
+
+function cardHTML(ch, i) {
+  const isPlaying = state.currentChannel && state.currentChannel.url === ch.url;
+  const initials = ch.name.replace(/[^a-zA-Z0-9]/g, '').slice(0, 3).toUpperCase() || '?';
+  return `<div class="channel-card${isPlaying ? ' playing' : ''}" data-idx="${i}">
+    <div class="channel-logo-wrap">
+      ${ch.logo
+        ? `<img src="${ch.logo}" onerror="this.style.display='none';this.nextSibling.style.display='block'" loading="lazy">
+           <div class="channel-initials" style="display:none">${initials}</div>`
+        : `<div class="channel-initials">${initials}</div>`}
+      ${isPlaying ? '<div class="channel-playing-badge">▶ NOW</div>' : ''}
+    </div>
+    <div class="channel-info">
+      <div class="channel-name">${ch.name}</div>
+      <div class="channel-group">${ch.group}</div>
+    </div>
+  </div>`;
+}
+
+function renderChannels(query = '') {
+  filterChannels(query);
+  const list = state.filtered;
+
+  channelGrid.innerHTML = '';
+  channelGrid.scrollTop = 0;
 
   if (list.length === 0) {
     channelGrid.innerHTML = `<div class="empty-state" style="grid-column:1/-1">
@@ -1205,25 +1238,41 @@ function renderChannels(query = '') {
     return;
   }
 
-  channelGrid.innerHTML = list.map((ch, i) => {
-    const isPlaying = state.currentChannel && state.currentChannel.url === ch.url;
-    const initials = ch.name.replace(/[^a-zA-Z0-9]/g, '').slice(0, 3).toUpperCase() || '?';
-    const delay = Math.min(i * 20, 400);
-    return `<div class="channel-card${isPlaying ? ' playing' : ''}" 
-              data-idx="${i}" style="animation-delay:${delay}ms">
-      <div class="channel-logo-wrap">
-        ${ch.logo
-          ? `<img src="${ch.logo}" onerror="this.style.display='none';this.nextSibling.style.display='block'" loading="lazy">
-             <div class="channel-initials" style="display:none">${initials}</div>`
-          : `<div class="channel-initials">${initials}</div>`}
-        ${isPlaying ? '<div class="channel-playing-badge">▶ NOW</div>' : ''}
-      </div>
-      <div class="channel-info">
-        <div class="channel-name">${ch.name}</div>
-        <div class="channel-group">${ch.group}</div>
-      </div>
-    </div>`;
-  }).join('');
+  // Render first batch immediately
+  appendBatch(0);
+}
+
+function appendBatch(startIdx) {
+  const list = state.filtered;
+  const end = Math.min(startIdx + PAGE_SIZE, list.length);
+  const frag = document.createDocumentFragment();
+  const tmp = document.createElement('div');
+  for (let i = startIdx; i < end; i++) {
+    tmp.innerHTML = cardHTML(list[i], i);
+    frag.appendChild(tmp.firstElementChild);
+  }
+  // Remove sentinel if present
+  const old = channelGrid.querySelector('.load-sentinel');
+  if (old) old.remove();
+
+  channelGrid.appendChild(frag);
+
+  // If more to load, add an IntersectionObserver sentinel
+  if (end < list.length) {
+    const sentinel = document.createElement('div');
+    sentinel.className = 'load-sentinel';
+    sentinel.style.cssText = 'grid-column:1/-1;height:40px;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px;font-family:JetBrains Mono,monospace';
+    sentinel.textContent = `${list.length - end} more…`;
+    channelGrid.appendChild(sentinel);
+
+    const obs = new IntersectionObserver(entries => {
+      if (entries[0].isIntersecting) {
+        obs.disconnect();
+        appendBatch(end);
+      }
+    }, { root: channelGrid, rootMargin: '200px' });
+    obs.observe(sentinel);
+  }
 }
 
 channelGrid.addEventListener('click', e => {
@@ -1239,7 +1288,10 @@ channelGrid.addEventListener('click', e => {
 // SEARCH
 // ══════════════════════════════════════════
 searchInput.addEventListener('input', e => {
-  renderChannels(e.target.value.toLowerCase());
+  clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = setTimeout(() => {
+    renderChannels(e.target.value.toLowerCase());
+  }, 250);
 });
 
 // ══════════════════════════════════════════
