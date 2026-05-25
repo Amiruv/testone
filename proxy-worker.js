@@ -1,50 +1,47 @@
-// ─── STRM Proxy — Cloudflare Worker ───────────────────────────────────────
-// Deploy at: https://workers.cloudflare.com (free, no credit card)
-// This worker fetches your M3U URL server-side, bypassing CORS entirely.
+addEventListener('fetch', event => {
+  event.respondWith(handleRequest(event.request))
+})
 
-export default {
-  async fetch(request) {
-    const url = new URL(request.url);
+async function handleRequest(request) {
+  const url = new URL(request.url)
 
-    // CORS preflight
-    if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: corsHeaders() });
-    }
-
-    const target = url.searchParams.get('url');
-    if (!target) {
-      return new Response('Missing ?url= parameter', { status: 400, headers: corsHeaders() });
-    }
-
-    try {
-      const res = await fetch(target, {
-        headers: {
-          // Forward a neutral User-Agent so the IPTV server doesn't block us
-          'User-Agent': 'Mozilla/5.0 (compatible; STRM/1.0)',
-          'Accept': '*/*',
-        },
-        redirect: 'follow',
-      });
-
-      // Stream the response straight through
-      return new Response(res.body, {
-        status: res.status,
-        headers: {
-          ...corsHeaders(),
-          'Content-Type': res.headers.get('Content-Type') || 'application/octet-stream',
-          'Cache-Control': 'no-cache',
-        },
-      });
-    } catch (err) {
-      return new Response('Fetch failed: ' + err.message, { status: 502, headers: corsHeaders() });
-    }
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: corsHeaders() })
   }
-};
+
+  const target = url.searchParams.get('url')
+  if (!target) {
+    return new Response('Missing ?url= parameter', { status: 400, headers: corsHeaders() })
+  }
+
+  try {
+    const response = await fetch(target, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      redirect: 'follow',
+    })
+
+    const headers = corsHeaders()
+    headers['Content-Type'] = response.headers.get('Content-Type') || 'application/octet-stream'
+    headers['Cache-Control'] = 'no-cache'
+
+    return new Response(response.body, {
+      status: response.status,
+      headers: headers,
+    })
+  } catch (err) {
+    return new Response('Proxy error: ' + err.message, { status: 502, headers: corsHeaders() })
+  }
+}
 
 function corsHeaders() {
   return {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
     'Access-Control-Allow-Headers': '*',
-  };
+  }
 }
