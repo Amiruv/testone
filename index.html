@@ -192,7 +192,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'DM San
     </div>
     <div class="setup-error" id="setup-error"></div>
 
-    <div class="proxy-row" id="proxy-row">
+    <div class="proxy-row" id="proxy-row" style="display:block">
       <label>⚡ Personal Proxy URL (fixes 403 — see proxy-worker.js)</label>
       <input class="setup-input" id="proxy-input" type="url" placeholder="https://your-worker.workers.dev" autocomplete="off">
     </div>
@@ -783,6 +783,19 @@ function showPlayerError(msg) {
   playerErr.textContent = '⚠ ' + msg;
 }
 
+// ── resolve stream URL: if http:// and page is https://, route via proxy ──
+function resolveStreamUrl(rawUrl) {
+  const personalProxy = (localStorage.getItem('strm_proxy') || '').trim();
+  const isHTTP = rawUrl.startsWith('http://');
+  const pageHTTPS = location.protocol === 'https:';
+  // Mixed content: http stream on https page → must proxy
+  if (isHTTP && pageHTTPS && personalProxy) {
+    return personalProxy + '?url=' + encodeURIComponent(rawUrl);
+  }
+  // If no proxy configured, still try direct (works on http:// hosted app or if server sends right headers)
+  return rawUrl;
+}
+
 function playChannel(ch, idx) {
   if (!ch) return;
   state.currentChannel = ch;
@@ -795,78 +808,124 @@ function playChannel(ch, idx) {
   showPlayerLoading('Connecting…');
   setPlayIcon(false);
 
-  // Reset video
+  // Reset video fully
   if (state.hls) { state.hls.destroy(); state.hls = null; }
   videoEl.pause();
   videoEl.removeAttribute('src');
   videoEl.load();
 
-  const url = ch.url;
-  console.log('[STRM] Playing:', url);
+  const rawUrl = ch.url;
+  const url = resolveStreamUrl(rawUrl);
+  const proxied = url !== rawUrl;
 
-  // Determine stream type
-  const isHLS = /\.m3u8|\/hls\//i.test(url) || url.includes('m3u8');
-  const isDASH = /\.mpd/i.test(url);
+  console.log('[STRM] Playing:', rawUrl, proxied ? '(proxied)' : '(direct)');
 
-  if (isHLS && Hls.isSupported()) {
+  // Mixed content warning — no proxy set
+  const isHTTP = rawUrl.startsWith('http://');
+  const pageHTTPS = location.protocol === 'https:';
+  const proxy = (localStorage.getItem('strm_proxy') || '').trim();
+  if (isHTTP && pageHTTPS && !proxy) {
+    showPlayerError(
+      'HTTP stream blocked on HTTPS. Fix: (1) Set up Cloudflare proxy worker and paste URL in setup screen, ' +
+      'OR (2) host STRM on http:// instead of https://'
+    );
+    // Still try direct — some browsers allow it
+  }
+
+  // Treat everything from this provider as HLS (get.php endpoints are almost always HLS)
+  const looksLikeHLS = /\.m3u8|\/hls\/|get\.php|ts\?|stream/i.test(rawUrl) || rawUrl.includes('m3u8');
+
+  function tryHLS(streamUrl) {
+    if (!Hls.isSupported()) { tryDirect(streamUrl); return; }
+    if (state.hls) { state.hls.destroy(); }
     state.hls = new Hls({
-      enableWorker: false,       // safer on mobile
+      enableWorker: false,
       lowLatencyMode: true,
-      maxBufferLength: 30,
-      manifestLoadingTimeOut: 15000,
-      manifestLoadingMaxRetry: 3,
+      maxBufferLength: 60,
+      maxMaxBufferLength: 120,
+      manifestLoadingTimeOut: 20000,
+      manifestLoadingMaxRetry: 2,
+      xhrSetup: (xhr) => { xhr.withCredentials = false; },
     });
-    state.hls.loadSource(url);
+    state.hls.loadSource(streamUrl);
     state.hls.attachMedia(videoEl);
     state.hls.on(Hls.Events.MANIFEST_PARSED, () => {
       hidePlayerLoading();
-      videoEl.play().catch(e => showPlayerError('Autoplay blocked — tap ▶'));
+      videoEl.play().catch(() => {
+        hidePlayerLoading();
+        showPlayerError('Tap ▶ to start');
+      });
     });
     state.hls.on(Hls.Events.ERROR, (ev, data) => {
-      console.warn('[HLS]', data.type, data.details);
+      console.warn('[HLS error]', data.type, data.details, data);
       if (data.fatal) {
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          showPlayerError('Network error — stream unreachable');
+        if (data.details === 'manifestLoadError' || data.details === 'manifestParsingError') {
+          // Not HLS — try as direct video
+          console.log('[STRM] Not HLS, trying direct');
+          state.hls.destroy(); state.hls = null;
+          tryDirect(streamUrl);
         } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
           state.hls.recoverMediaError();
         } else {
-          showPlayerError('Stream error: ' + data.details);
+          showPlayerError('Stream error: ' + data.details + (isHTTP && pageHTTPS && !proxy ? ' (HTTP blocked on HTTPS — set up proxy)' : ''));
         }
       }
     });
-  } else if (isHLS && videoEl.canPlayType('application/vnd.apple.mpegurl')) {
-    // Safari / iOS native HLS
+  }
+
+  function tryDirect(streamUrl) {
+    videoEl.src = streamUrl;
+    videoEl.load();
+    const p = videoEl.play();
+    if (p) p.catch(err => {
+      console.warn('[direct play error]', err);
+      if (err.name === 'NotAllowedError') {
+        hidePlayerLoading();
+        showPlayerError('Tap ▶ to play');
+      } else {
+        showPlayerError('Cannot play: ' + err.message + (isHTTP && pageHTTPS && !proxy ? ' — HTTP stream blocked on HTTPS. Add proxy.' : ''));
+      }
+    });
+  }
+
+  // Native HLS check (Safari/iOS)
+  if (looksLikeHLS && videoEl.canPlayType('application/vnd.apple.mpegurl') && !Hls.isSupported()) {
     videoEl.src = url;
     videoEl.load();
     videoEl.play().catch(() => showPlayerError('Tap ▶ to play'));
   } else {
-    // Direct URL (MP4, RTMP fallback, etc.)
-    videoEl.src = url;
-    videoEl.load();
-    videoEl.play().catch(() => showPlayerError('Tap ▶ to play'));
+    tryHLS(url);
   }
 
   // Detect live vs VOD
-  const onDur = () => {
+  videoEl.addEventListener('durationchange', () => {
     const dur = videoEl.duration;
     const isLive = !isFinite(dur) || dur > 7 * 3600;
     liveBadge.style.display = isLive ? 'inline' : 'none';
-    seekBar.style.display   = isLive ? 'none'   : '';
+    seekBar.style.display   = isLive ? 'none' : '';
     $('time-current').style.display = isLive ? 'none' : '';
     $('time-duration').style.display = isLive ? 'none' : '';
     if (!isLive) { seekBar.max = dur; $('time-duration').textContent = fmtTime(dur); }
     state.isLive = isLive;
-  };
-  videoEl.addEventListener('durationchange', onDur, { once: true });
+  }, { once: true });
 }
 
 videoEl.addEventListener('playing', hidePlayerLoading);
 videoEl.addEventListener('waiting', () => showPlayerLoading('Buffering…'));
 videoEl.addEventListener('play',  () => setPlayIcon(true));
 videoEl.addEventListener('pause', () => setPlayIcon(false));
-videoEl.addEventListener('error', e => {
-  const codes = {1:'Aborted',2:'Network error',3:'Decode error',4:'Source not supported'};
-  showPlayerError(codes[videoEl.error?.code] || 'Playback error');
+videoEl.addEventListener('error', () => {
+  const c = videoEl.error?.code;
+  const msgs = {1:'Playback aborted',2:'Network error loading stream',3:'Video decode error',4:'Format not supported'};
+  const base = msgs[c] || 'Playback error (code ' + c + ')';
+  const rawUrl = state.currentChannel?.url || '';
+  const isHTTP = rawUrl.startsWith('http://');
+  const pageHTTPS = location.protocol === 'https:';
+  const proxy = (localStorage.getItem('strm_proxy') || '').trim();
+  const hint = (isHTTP && pageHTTPS && !proxy)
+    ? ' — HTTP stream on HTTPS page. Go back to setup and add your Cloudflare proxy URL.'
+    : '';
+  showPlayerError(base + hint);
 });
 
 videoEl.addEventListener('timeupdate', () => {
